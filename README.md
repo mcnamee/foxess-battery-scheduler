@@ -95,22 +95,53 @@ required).
 5. Restart Home Assistant (or reload `shell_command` configuration) so the new
    commands are available.
 
-You can then call these from an automation — for example, grid-charge to 100%
-during today's off-peak window:
+You can then call these from an automation. For example, to grid-charge to 100%
+between 12:00 and 14:00 on Saturdays and Sundays:
 
 ```yaml
 automation:
-  - alias: Grid charge during off-peak
+  # Saturdays and Sundays: put the 12:00-14:00 force-charge window in place.
+  # Written a few minutes early so the schedule is live before the window opens.
+  - alias: Weekend grid charge - set window
     trigger:
       - platform: time
-        at: "12:00:00"
+        at: "11:55:00"
+    condition:
+      - condition: time
+        weekday:
+          - sat
+          - sun
     action:
       - service: shell_command.foxess_force_charge
         data:
           start: "12:00"
           end: "14:00"
           max_soc: 100
+
+  # Remove it once the window has passed, so it does not run on weekdays.
+  - alias: Weekend grid charge - clear window
+    trigger:
+      - platform: time
+        at: "14:05:00"
+    condition:
+      - condition: time
+        weekday:
+          - sat
+          - sun
+    action:
+      - service: shell_command.foxess_clear
 ```
+
+**Why two automations?** A scheduler group holds only start and end *times* —
+there is no day-of-week field (see `build_group()`). Whatever window you write
+stays on the inverter and repeats **every day** until it is cleared. So setting
+a window on Saturday without clearing it would keep force-charging 12:00-14:00
+on Monday through Friday too, quite possibly at peak rates. The second
+automation is what makes it weekend-only.
+
+If your off-peak window moves from day to day, replace the fixed `"12:00"` /
+`"14:00"` above with templates drawn from whatever sensor or input helper holds
+today's times, and keep the clear automation as-is.
 
 ### Which path do I use: `/config` or `/homeassistant`?
 
