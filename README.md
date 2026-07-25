@@ -55,16 +55,34 @@ In short:
 The script only needs Python 3 (standard library only — no `pip install`
 required).
 
-1. Copy `foxess_schedule.py` into your Home Assistant config, e.g.
+1. **Create a `scripts` folder in your Home Assistant config directory.** It does
+   not exist by default — `/config/scripts/` is simply the location this script
+   defaults to. Put it alongside `configuration.yaml`, using whichever tool you
+   have: create a new folder in the File Editor or Studio Code Server add-on,
+   create one in the `config` Samba share, or run `mkdir -p /homeassistant/scripts`
+   from the Terminal & SSH add-on.
+
+   The file must live somewhere under the Home Assistant config directory.
+   `shell_command` runs inside the HA Core container, and that directory is
+   effectively the only persistent, writable path Core can see — a script in
+   `/root/` or `/usr/local/bin/` would not be reachable.
+
+   > **Do not use the `python_scripts/` folder.** That belongs to the
+   > `python_script` integration, which runs a sandboxed Python that forbids
+   > `import`. This script imports from the standard library and would fail
+   > immediately. Use a plain folder such as `scripts/` and call it via
+   > `shell_command`.
+
+2. Copy `foxess_schedule.py` into that folder, e.g.
    `/config/scripts/foxess_schedule.py`.
 
-2. Make it executable (optional, for standalone use):
+3. Make it executable (optional, for standalone use):
 
    ```bash
    chmod +x /config/scripts/foxess_schedule.py
    ```
 
-3. Register it as a `shell_command` in your `configuration.yaml`:
+4. Register it as a `shell_command` in your `configuration.yaml`:
 
    ```yaml
    shell_command:
@@ -74,7 +92,7 @@ required).
      foxess_clear: python3 /config/scripts/foxess_schedule.py --quiet clear
    ```
 
-4. Restart Home Assistant (or reload `shell_command` configuration) so the new
+5. Restart Home Assistant (or reload `shell_command` configuration) so the new
    commands are available.
 
 You can then call these from an automation — for example, grid-charge to 100%
@@ -94,9 +112,44 @@ automation:
           max_soc: 100
 ```
 
+### Which path do I use: `/config` or `/homeassistant`?
+
+On Home Assistant OS the config directory is visible at **two different paths
+depending on which container you are in** — they are the same folder:
+
+| Where you are                        | Config directory appears as |
+| ------------------------------------ | --------------------------- |
+| HA Core (where `shell_command` runs) | `/config`                   |
+| Add-ons (Terminal & SSH, etc.)       | `/homeassistant`            |
+
+The practical rule:
+
+- **In `configuration.yaml`, always write `/config/scripts/...`** — that is the
+  path HA Core sees when it runs your `shell_command`.
+- **In an add-on terminal, use whichever path that terminal shows you**
+  (usually `/homeassistant/scripts/...`) when creating the folder or running
+  the script by hand.
+
+Credential auto-discovery handles both — the script probes `/config` and
+`/homeassistant` in turn. But `--config` and the log file default to `/config/...`
+specifically, so when testing from an add-on terminal you may need to pass
+`--config /homeassistant/scripts/foxess.conf` there, while the `shell_command`
+entry stays on `/config/...`.
+
 ### Testing from a terminal
 
-The script is fully runnable standalone for testing:
+The script is fully runnable standalone for testing. From the Terminal & SSH
+add-on, check your placement worked before wiring up any automation:
+
+```bash
+python3 /homeassistant/scripts/foxess_schedule.py --dry-run get
+```
+
+You do not need to create `foxess.conf` or the log file first — the logger
+creates its own directory, and if `foxess-ha` is already configured your
+credentials are discovered automatically.
+
+Other commands:
 
 ```bash
 # Read the current schedule
