@@ -147,13 +147,13 @@ Credentials and options are resolved in the following order (**later sources win
 
 ### Configuration options
 
-| Key                | Where            | Default                        | Description                                                       |
-| ------------------ | ---------------- | ------------------------------ | ----------------------------------------------------------------- |
-| `api_key`          | file / env / HA  | —                              | FoxESS Open API key (required).                                   |
-| `device_sn`        | file / env / HA  | —                              | Inverter serial number (required).                                |
-| `min_soc_on_grid`  | file / CLI       | `10`                           | Grid-present discharge floor, percent.                            |
-| `log_file`         | file             | `/config/scripts/foxess.log`   | Path for the append log (rotates to `.1` at ~1 MB).               |
-| `log_max_bytes`    | file             | `1048576`                      | Log size before rotation.                                         |
+| Key               | Where           | Default                      | Description                                                                                                                     |
+| ----------------- | --------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `api_key`         | file / env / HA | —                            | FoxESS Open API key (required).                                                                                                 |
+| `device_sn`       | file / env / HA | —                            | Inverter serial number (required).                                                                                              |
+| `min_soc_on_grid` | file            | `10`                         | Grid-present discharge floor, percent. Applies only to `set` / `force-charge`, and is overridden by `--min-soc-on-grid` if given. |
+| `log_file`        | file            | `/config/scripts/foxess.log` | Path for the append log (rotates to `.1` at ~1 MB).                                                                             |
+| `log_max_bytes`   | file            | `1048576`                    | Log size before rotation.                                                                                                       |
 
 ### Command-line options
 
@@ -167,10 +167,12 @@ Global flags (must appear **before** the subcommand):
 
 - `--start HH:MM` / `--end HH:MM` — the window (24-hour; must not span midnight).
 - `--max-soc` — charge ceiling percent (default `100`).
-- `--min-soc-on-grid` — grid-present discharge floor percent.
+- `--min-soc-on-grid` — grid-present discharge floor percent. Falls back to
+  `min_soc_on_grid` from the config file, then `10`.
 - `--mode` — work mode for `set` (default `ForceCharge`).
-- `--fd-soc` / `--fd-pwr` — force-discharge floor and power (unused for
-  `ForceCharge`).
+- `--fd-soc` / `--fd-pwr` — force-discharge floor percent and power in watts
+  (unused for `ForceCharge`). `--fd-soc` defaults to the effective
+  `min-soc-on-grid`; `--fd-pwr` defaults to `0`.
 
 ### Notes and limits
 

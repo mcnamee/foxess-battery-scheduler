@@ -11,7 +11,9 @@ Usage:
     foxess_schedule.py clear
     foxess_schedule.py settings          # read current WorkMode / SoC settings
 
-Add --dry-run to any command to print the request without sending it.
+--dry-run prints the request without sending it. It, --quiet and --config are
+global options, so they go BEFORE the subcommand, not after:
+    foxess_schedule.py --dry-run force-charge --start 12:00 --end 14:00
 
 Credentials are resolved in this order (later wins):
     1. Auto-discovered from an existing macxq/foxess-ha platform block in
