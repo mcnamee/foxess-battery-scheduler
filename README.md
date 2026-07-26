@@ -13,13 +13,13 @@ write the inverter's **scheduler**. It lets you:
 - **`force-charge`** — set a one-off window in which the battery charges from the
   grid up to a target state of charge (e.g. charge to 100% between 12:00 and
   14:00 while your tariff is cheap or free).
-- **`set`** — write a single-window schedule for any supported work mode
-  (`SelfUse`, `Feedin`, `Backup`, `ForceCharge`, `ForceDischarge`,
-  `PeakShaving`).
-- **`clear`** — remove all scheduler groups so the inverter reverts to its
-  normal work-mode setting.
+- **`set`** — write a single-window schedule for any work mode in the scheduler
+  enumeration (`SelfUse`, `Feedin`, `Backup`, `ForceCharge`, `ForceDischarge`).
+- **`clear`** — remove all scheduler groups and switch the scheduler off, so the
+  inverter reverts to its normal work-mode setting.
 - **`get`** — read the schedule currently on the inverter.
 - **`settings`** — read the current work mode and state-of-charge settings.
+- **`flag`** — read, or explicitly set, the scheduler master switch.
 
 The typical use case: your energy company publishes cheap/free off-peak periods
 that change each day, so a Home Assistant automation calls this script with the
@@ -27,8 +27,29 @@ right start/end times to grid-charge the battery during that window, then clears
 the schedule afterwards.
 
 Every command supports `--dry-run` to log the request without sending it, which
-is useful for testing automations. Note that `--dry-run`, `--quiet` and
-`--config` are global flags and must be placed **before** the subcommand.
+is useful for testing automations. Note that `--dry-run`, `--quiet`, `--config`
+and `--api-version` are global flags and must be placed **before** the
+subcommand.
+
+### How grid charging is actually controlled
+
+There is no "charge from grid" boolean in the FoxESS API. Two parameters decide
+whether a `ForceCharge` window does anything, and the API document describes
+both as shared **FC/FD** fields — they apply to Force *Charge* as well as Force
+*Discharge*:
+
+| Parameter | Meaning in `ForceCharge` | Default here |
+| --- | --- | --- |
+| `fdPwr` | Ceiling on AC power the inverter may draw **from the grid**. `0` means it may not import at all, so nothing charges. | `6000` W |
+| `fdSoc` | The SoC at which charging **stops**. Set below the current SoC and charging ends immediately. | same as `--max-soc` |
+
+Both are settable with `--fd-pwr` / `--fd-soc`, and the script warns if you
+choose values that would silently do nothing.
+
+Separately, the scheduler has a **master switch** ("timing mode"). Groups
+written while it is off are stored but never act. `set` / `force-charge` turn it
+on and `clear` turns it off; use `--no-master-switch` to leave it untouched, or
+the `flag` subcommand to inspect it.
 
 ## Dependency on the macxq foxess-ha HACS integration
 
@@ -221,6 +242,23 @@ Credentials and options are resolved in the following order (**later sources win
 
 3. **Environment variables** — `FOXESS_API_KEY` and `FOXESS_DEVICE_SN`.
 
+### Scheduler API version
+
+FoxESS has published several scheduler API versions and they are not
+interchangeable. The default is **v3**, the current one.
+
+| Version | Endpoint | Notes |
+| --- | --- | --- |
+| `v3` | `/op/v3/device/scheduler/enable` | Default. SoC and power fields nest inside `extraParam`; no per-group `enable`. |
+| `v1` | `/op/v1/device/scheduler/enable` | Flat group with `maxSoc`. Use this if your inverter does not support v3. |
+| `v0` | `/op/v0/device/scheduler/enable` | Marked **Deprecated** in the API document, and has **no `maxSoc` field** — `--max-soc` is silently ignored. The script warns if you select it. |
+
+Set it per-run with `--api-version v1`, or persistently with `api_version = v1`
+in the config file. If a write fails on v3, v1 is the fallback to try first.
+
+The full API document is committed as [`foxess-openapi.pdf`](foxess-openapi.pdf);
+the scheduler sections are around pages 104–136.
+
 ### Getting your credentials
 
 - **API key** — generate an API key in the
@@ -235,7 +273,9 @@ Credentials and options are resolved in the following order (**later sources win
 | ----------------- | --------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `api_key`         | file / env / HA | —                            | FoxESS Open API key (required).                                                                                                 |
 | `device_sn`       | file / env / HA | —                            | Inverter serial number (required).                                                                                              |
-| `min_soc_on_grid` | file            | `10`                         | Grid-present discharge floor, percent. Applies only to `set` / `force-charge`, and is overridden by `--min-soc-on-grid` if given. |
+| `min_soc_on_grid` | file            | `10`                         | Grid-present discharge floor, percent (10–100). Applies only to `set` / `force-charge`, and is overridden by `--min-soc-on-grid` if given. |
+| `fd_pwr`          | file            | `6000`                       | Max force charge/discharge power in watts (0–6000). For `ForceCharge` this caps grid import. Overridden by `--fd-pwr`.           |
+| `api_version`     | file            | `v3`                         | Scheduler API version: `v0`, `v1` or `v3`. Overridden by `--api-version`.                                                       |
 | `log_file`        | file            | `/config/scripts/foxess.log` | Path for the append log (rotates to `.1` at ~1 MB).                                                                             |
 | `log_max_bytes`   | file            | `1048576`                    | Log size before rotation.                                                                                                       |
 
@@ -246,23 +286,36 @@ Global flags (must appear **before** the subcommand):
 - `--config PATH` — path to the config file.
 - `--dry-run` — log the request but do not send it.
 - `--quiet` — log to file only, not stdout (recommended for `shell_command`).
+- `--api-version {v0,v1,v3}` — scheduler API version (default `v3`).
+- `--no-master-switch` — do not touch the scheduler master switch.
 
 `set` / `force-charge` flags:
 
 - `--start HH:MM` / `--end HH:MM` — the window (24-hour; must not span midnight).
-- `--max-soc` — charge ceiling percent (default `100`).
-- `--min-soc-on-grid` — grid-present discharge floor percent. Falls back to
-  `min_soc_on_grid` from the config file, then `10`.
+- `--max-soc` — charge ceiling percent (default `100`). Ignored on `v0`.
+- `--min-soc-on-grid` — grid-present discharge floor percent (10–100). Falls back
+  to `min_soc_on_grid` from the config file, then `10`.
 - `--mode` — work mode for `set` (default `ForceCharge`).
-- `--fd-soc` / `--fd-pwr` — force-discharge floor percent and power in watts
-  (unused for `ForceCharge`). `--fd-soc` defaults to the effective
-  `min-soc-on-grid`; `--fd-pwr` defaults to `0`.
+- `--fd-soc` — the SoC at which force charge/discharge **stops**. Defaults to
+  `--max-soc` for `ForceCharge`, otherwise to the effective `min-soc-on-grid`.
+  Must be ≥ `minSocOnGrid`.
+- `--fd-pwr` — max force charge/discharge power in watts (0–6000). For
+  `ForceCharge` this is the ceiling on **grid import**, so `0` disables charging.
+  Falls back to `fd_pwr` from the config file, then `6000`.
+
+`flag` flags: `--enable` / `--disable`. With neither, the switch is read.
 
 ### Notes and limits
 
 - The FoxESS Open API allows **1440 calls per day**, and query endpoints are
   rate-limited to roughly **1 request per second** — keep automations modest.
+  `set` / `force-charge` and `clear` each make **two** calls, since they also
+  flip the master switch.
 - Schedule windows cannot span midnight; split them into two windows if needed.
+- A scheduler group has no day-of-week field, so a window repeats every day
+  until it is cleared. See the weekend automation example above.
+- `PeakShaving` is accepted on the command line but is not in the scheduler
+  `workMode` enumeration, so the inverter may reject it. The script warns.
 - The API signature depends on the system clock, so keep your host's time
   accurate (NTP).
 

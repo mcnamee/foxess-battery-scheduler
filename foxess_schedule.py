@@ -10,10 +10,19 @@ Usage:
     foxess_schedule.py force-charge --start 12:00 --end 14:00 --max-soc 100
     foxess_schedule.py clear
     foxess_schedule.py settings          # read current WorkMode / SoC settings
+    foxess_schedule.py flag              # read the scheduler master switch
 
---dry-run prints the request without sending it. It, --quiet and --config are
-global options, so they go BEFORE the subcommand, not after:
+--dry-run prints the request without sending it. It, --quiet, --config and
+--api-version are global options, so they go BEFORE the subcommand, not after:
     foxess_schedule.py --dry-run force-charge --start 12:00 --end 14:00
+
+The scheduler API has several versions. v3 is the default and current one; v0 is
+deprecated and silently ignores maxSoc. Use --api-version v1 if your inverter
+does not support v3.
+
+Grid charging is controlled by fdPwr - the ceiling on AC power the inverter may
+draw from the grid while in ForceCharge - and stops at fdSoc. Both default to
+values that actually charge; passing --fd-pwr 0 disables force charging.
 
 Credentials are resolved in this order (later wins):
     1. Auto-discovered from an existing macxq/foxess-ha platform block in
@@ -44,19 +53,65 @@ DEFAULT_CONFIG = "/config/scripts/foxess.conf"
 DEFAULT_LOG = "/config/scripts/foxess.log"
 DEFAULT_LOG_MAX_BYTES = 1024 * 1024  # 1 MB before rotating to .1
 
-PATH_SCHEDULER_GET = "/op/v0/device/scheduler/get"
-PATH_SCHEDULER_ENABLE = "/op/v0/device/scheduler/enable"
 PATH_SETTING_GET = "/op/v0/device/setting/get"
 
-# FoxESS accepts these work mode strings in scheduler groups
-WORK_MODES = (
+DEFAULT_API_VERSION = "v3"
+
+# Scheduler endpoints per API version.
+#
+# v0 is marked "(Deprecated)" in the FoxESS Open API document and its group has
+# no maxSoc field. v1 adds maxSoc as a flat group field. v3 is the current
+# version: SoC/power fields move into a nested "extraParam" object and the
+# per-group "enable" field is gone.
+#
+# There are no v2/v3 master-switch endpoints in the document, so those versions
+# reuse the v1 flag paths.
+SCHEDULER_API = {
+    "v0": {
+        "get": "/op/v0/device/scheduler/get",
+        "enable": "/op/v0/device/scheduler/enable",
+        "get_flag": "/op/v0/device/scheduler/get/flag",
+        "set_flag": "/op/v0/device/scheduler/set/flag",
+    },
+    "v1": {
+        "get": "/op/v1/device/scheduler/get",
+        "enable": "/op/v1/device/scheduler/enable",
+        "get_flag": "/op/v1/device/scheduler/get/flag",
+        "set_flag": "/op/v1/device/scheduler/set/flag",
+    },
+    "v3": {
+        "get": "/op/v3/device/scheduler/get",
+        "enable": "/op/v3/device/scheduler/enable",
+        "get_flag": "/op/v1/device/scheduler/get/flag",
+        "set_flag": "/op/v1/device/scheduler/set/flag",
+    },
+}
+
+# The scheduler workMode enumeration, per the API document. PeakShaving is a
+# device setting rather than a scheduler mode - it is still accepted on the
+# command line, but warned about, because it is not in this enumeration.
+SCHEDULER_WORK_MODES = (
     "SelfUse",
     "Feedin",
     "Backup",
     "ForceCharge",
     "ForceDischarge",
-    "PeakShaving",
 )
+WORK_MODES = SCHEDULER_WORK_MODES + ("PeakShaving",)
+
+# Modes where fdSoc and fdPwr are meaningful. The API document describes both as
+# "FC/FD" fields - they apply to Force Charge as well as Force Discharge.
+FORCE_MODES = ("ForceCharge", "ForceDischarge")
+
+# fdPwr is documented as ranging 0-6000. For ForceCharge it is the ceiling on AC
+# power drawn from the grid, so 0 means "never import" and force charging simply
+# does nothing. Default to the documented maximum and let the inverter clamp to
+# whatever its hardware allows.
+DEFAULT_FD_PWR = 6000
+FD_PWR_MAX = 6000
+
+# minSocOnGrid is documented as ranging 10-100.
+MIN_SOC_ON_GRID_FLOOR = 10
 
 
 # ---------------------------------------------------------------- logging
@@ -319,29 +374,98 @@ def parse_hhmm(value, label):
     return hour, minute
 
 
-def build_group(start, end, work_mode, max_soc, min_soc_on_grid, fd_soc, fd_pwr):
+def resolve_force_params(work_mode, max_soc, min_soc_on_grid, fd_soc, fd_pwr, log):
+    """
+    Work out fdSoc and fdPwr, which the API document describes as shared "FC/FD"
+    fields - they govern Force Charge as well as Force Discharge:
+
+      fdSoc - the SoC at which the system stops charging or discharging. For
+              ForceCharge that is the charge target, so it defaults to maxSoc;
+              defaulting it to the discharge floor stops charging immediately.
+      fdPwr - the maximum power allowed in that mode. For ForceCharge it caps
+              the AC power drawn from the grid, so 0 means the inverter may not
+              import at all and nothing charges.
+    """
+    if fd_soc is None:
+        fd_soc = max_soc if work_mode == "ForceCharge" else min_soc_on_grid
+    if fd_pwr is None:
+        fd_pwr = DEFAULT_FD_PWR
+
+    if not (0 <= fd_soc <= 100):
+        raise SystemExit("--fd-soc must be between 0 and 100, got {}".format(fd_soc))
+    if fd_soc < min_soc_on_grid:
+        raise SystemExit(
+            "--fd-soc ({}) must be greater than or equal to minSocOnGrid ({})".format(
+                fd_soc, min_soc_on_grid))
+    if not (0 <= fd_pwr <= FD_PWR_MAX):
+        raise SystemExit("--fd-pwr must be between 0 and {}, got {}".format(
+            FD_PWR_MAX, fd_pwr))
+
+    if work_mode in FORCE_MODES and fd_pwr == 0:
+        log.warn("--fd-pwr is 0, so {} cannot move any power and will appear to "
+                 "do nothing".format(work_mode))
+    if work_mode == "ForceCharge" and fd_soc <= min_soc_on_grid:
+        log.warn("--fd-soc ({}) is at or below minSocOnGrid ({}), so charging "
+                 "will stop almost immediately".format(fd_soc, min_soc_on_grid))
+    return fd_soc, fd_pwr
+
+
+def build_group(version, start, end, work_mode, max_soc, min_soc_on_grid,
+                fd_soc, fd_pwr):
+    """
+    Build one scheduler group in the shape the given API version expects.
+
+    v0 has no maxSoc field at all - passing it there is silently ignored, which
+    is why --max-soc used to have no effect. v3 nests the SoC and power fields
+    inside extraParam and dropped the per-group enable flag.
+    """
     start_hour, start_minute = parse_hhmm(start, "--start")
     end_hour, end_minute = parse_hhmm(end, "--end")
     if (end_hour, end_minute) <= (start_hour, start_minute):
         raise SystemExit("--end must be later than --start (no midnight-spanning windows)")
-    return {
-        "enable": 1,
+
+    group = {
         "startHour": start_hour,
         "startMinute": start_minute,
         "endHour": end_hour,
         "endMinute": end_minute,
         "workMode": work_mode,
-        "minSocOnGrid": min_soc_on_grid,
-        "fdSoc": fd_soc,
-        "fdPwr": fd_pwr,
-        "maxSoc": max_soc,
     }
+
+    if version == "v3":
+        group["extraParam"] = {
+            "minSocOnGrid": min_soc_on_grid,
+            "fdSoc": fd_soc,
+            "fdPwr": fd_pwr,
+            "maxSoc": max_soc,
+        }
+        return group
+
+    group["enable"] = 1
+    group["minSocOnGrid"] = min_soc_on_grid
+    group["fdSoc"] = fd_soc
+    group["fdPwr"] = fd_pwr
+    if version != "v0":  # v0 has no maxSoc
+        group["maxSoc"] = max_soc
+    return group
+
+
+def set_master_switch(version, config, log, enable, dry_run):
+    """
+    Flip the scheduler master switch ("timing mode"). Groups written while this
+    is off are stored but never act, which looks exactly like a schedule that
+    does nothing.
+    """
+    log.info("setting scheduler master switch to {}".format(enable))
+    api_post(SCHEDULER_API[version]["set_flag"], config["api_key"],
+             {"deviceSN": config["device_sn"], "enable": enable},
+             log, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------- commands
 
 def cmd_get(args, config, log):
-    api_post(PATH_SCHEDULER_GET, config["api_key"],
+    api_post(SCHEDULER_API[args.api_version]["get"], config["api_key"],
              {"deviceSN": config["device_sn"]}, log, dry_run=args.dry_run)
 
 
@@ -357,30 +481,77 @@ def cmd_settings(args, config, log):
 
 
 def cmd_set(args, config, log):
+    version = args.api_version
     min_soc_on_grid = int(args.min_soc_on_grid
                           if args.min_soc_on_grid is not None
-                          else config.get("min_soc_on_grid", 10))
+                          else config.get("min_soc_on_grid", MIN_SOC_ON_GRID_FLOOR))
+    if not (MIN_SOC_ON_GRID_FLOOR <= min_soc_on_grid <= 100):
+        raise SystemExit("minSocOnGrid must be between {} and 100, got {}".format(
+            MIN_SOC_ON_GRID_FLOOR, min_soc_on_grid))
+    if args.mode not in SCHEDULER_WORK_MODES:
+        log.warn("'{}' is not in the scheduler workMode enumeration ({}) - the "
+                 "inverter may reject it".format(
+                     args.mode, ", ".join(SCHEDULER_WORK_MODES)))
+
+    fd_pwr = args.fd_pwr
+    if fd_pwr is None and config.get("fd_pwr"):
+        fd_pwr = int(config["fd_pwr"])
+    fd_soc, fd_pwr = resolve_force_params(
+        work_mode=args.mode,
+        max_soc=args.max_soc,
+        min_soc_on_grid=min_soc_on_grid,
+        fd_soc=args.fd_soc,
+        fd_pwr=fd_pwr,
+        log=log,
+    )
+
     group = build_group(
+        version=version,
         start=args.start,
         end=args.end,
         work_mode=args.mode,
         max_soc=args.max_soc,
         min_soc_on_grid=min_soc_on_grid,
-        fd_soc=args.fd_soc if args.fd_soc is not None else min_soc_on_grid,
-        fd_pwr=args.fd_pwr,
+        fd_soc=fd_soc,
+        fd_pwr=fd_pwr,
     )
-    log.info("setting single {} window {}-{} maxSoc={} minSocOnGrid={}".format(
-        args.mode, args.start, args.end, args.max_soc, min_soc_on_grid))
-    api_post(PATH_SCHEDULER_ENABLE, config["api_key"],
-             {"deviceSN": config["device_sn"], "groups": [group]},
+    log.info("setting single {} window {}-{} on {} maxSoc={} minSocOnGrid={} "
+             "fdSoc={} fdPwr={}".format(args.mode, args.start, args.end, version,
+                                        args.max_soc, min_soc_on_grid, fd_soc, fd_pwr))
+
+    # The groups are useless while the master switch is off, so turn it on first.
+    if not args.no_master_switch:
+        set_master_switch(version, config, log, 1, args.dry_run)
+        time.sleep(1.1)  # stay inside the ~1 request/second budget
+
+    payload = {"deviceSN": config["device_sn"], "groups": [group]}
+    if version == "v3":
+        # false: leave extraParam fields we did not send alone.
+        payload["isDefault"] = False
+    api_post(SCHEDULER_API[version]["enable"], config["api_key"], payload,
              log, dry_run=args.dry_run)
 
 
 def cmd_clear(args, config, log):
+    version = args.api_version
     log.info("clearing all scheduler groups - inverter reverts to its work mode setting")
-    api_post(PATH_SCHEDULER_ENABLE, config["api_key"],
+    api_post(SCHEDULER_API[version]["enable"], config["api_key"],
              {"deviceSN": config["device_sn"], "groups": []},
              log, dry_run=args.dry_run)
+    # Turning the master switch off is what actually hands control back to the
+    # inverter's own work mode setting.
+    if not args.no_master_switch:
+        time.sleep(1.1)
+        set_master_switch(version, config, log, 0, args.dry_run)
+
+
+def cmd_flag(args, config, log):
+    version = args.api_version
+    if args.enable is None:
+        api_post(SCHEDULER_API[version]["get_flag"], config["api_key"],
+                 {"deviceSN": config["device_sn"]}, log, dry_run=args.dry_run)
+        return
+    set_master_switch(version, config, log, args.enable, args.dry_run)
 
 
 # ---------------------------------------------------------------- cli
@@ -394,6 +565,12 @@ def main(argv=None):
                         help="log the request but do not send it")
     parser.add_argument("--quiet", action="store_true",
                         help="log to file only, not stdout")
+    parser.add_argument("--api-version", default=None,
+                        choices=sorted(SCHEDULER_API),
+                        help="scheduler API version (default: {}; v0 is "
+                             "deprecated and ignores maxSoc)".format(DEFAULT_API_VERSION))
+    parser.add_argument("--no-master-switch", action="store_true",
+                        help="do not touch the scheduler master switch")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -401,29 +578,37 @@ def main(argv=None):
     subparsers.add_parser("settings", help="read current work mode and SoC settings")
     subparsers.add_parser("clear", help="remove all schedule groups")
 
-    set_parser = subparsers.add_parser(
-        "set", help="write a single-window schedule")
-    set_parser.add_argument("--start", required=True, help="window start, HH:MM")
-    set_parser.add_argument("--end", required=True, help="window end, HH:MM")
-    set_parser.add_argument("--mode", default="ForceCharge", choices=WORK_MODES)
-    set_parser.add_argument("--max-soc", type=int, default=100,
-                            help="charge ceiling percent (default: %(default)s)")
-    set_parser.add_argument("--min-soc-on-grid", type=int, default=None,
-                            help="grid-present discharge floor percent")
-    set_parser.add_argument("--fd-soc", type=int, default=None,
-                            help="force-discharge floor percent (unused for ForceCharge)")
-    set_parser.add_argument("--fd-pwr", type=int, default=0,
-                            help="force-discharge power in watts (default: %(default)s)")
+    flag_parser = subparsers.add_parser(
+        "flag", help="read or set the scheduler master switch")
+    flag_group = flag_parser.add_mutually_exclusive_group()
+    flag_group.add_argument("--enable", dest="enable", action="store_const", const=1,
+                            help="turn the scheduler on")
+    flag_group.add_argument("--disable", dest="enable", action="store_const", const=0,
+                            help="turn the scheduler off")
+    flag_parser.set_defaults(enable=None)
 
+    def add_window_args(sub, with_mode):
+        sub.add_argument("--start", required=True, help="window start, HH:MM")
+        sub.add_argument("--end", required=True, help="window end, HH:MM")
+        if with_mode:
+            sub.add_argument("--mode", default="ForceCharge", choices=WORK_MODES)
+        sub.add_argument("--max-soc", type=int, default=100,
+                         help="charge ceiling percent (default: %(default)s)")
+        sub.add_argument("--min-soc-on-grid", type=int, default=None,
+                         help="grid-present discharge floor percent (10-100)")
+        sub.add_argument("--fd-soc", type=int, default=None,
+                         help="SoC at which force charge/discharge stops "
+                              "(default: maxSoc for ForceCharge, else minSocOnGrid)")
+        sub.add_argument("--fd-pwr", type=int, default=None,
+                         help="max power in watts for force charge/discharge; for "
+                              "ForceCharge this caps grid import, and 0 disables it "
+                              "(default: {})".format(DEFAULT_FD_PWR))
+
+    add_window_args(subparsers.add_parser(
+        "set", help="write a single-window schedule"), with_mode=True)
     # convenience alias matching the common case
-    fc_parser = subparsers.add_parser(
-        "force-charge", help="alias for: set --mode ForceCharge")
-    fc_parser.add_argument("--start", required=True, help="window start, HH:MM")
-    fc_parser.add_argument("--end", required=True, help="window end, HH:MM")
-    fc_parser.add_argument("--max-soc", type=int, default=100)
-    fc_parser.add_argument("--min-soc-on-grid", type=int, default=None)
-    fc_parser.add_argument("--fd-soc", type=int, default=None)
-    fc_parser.add_argument("--fd-pwr", type=int, default=0)
+    add_window_args(subparsers.add_parser(
+        "force-charge", help="alias for: set --mode ForceCharge"), with_mode=False)
 
     args = parser.parse_args(argv)
 
@@ -435,6 +620,16 @@ def main(argv=None):
     log.info("device {} - credentials {}".format(
         config["device_sn"], config["_source"]))
 
+    # CLI wins over the config file, which wins over the built-in default.
+    if args.api_version is None:
+        args.api_version = config.get("api_version", DEFAULT_API_VERSION)
+    if args.api_version not in SCHEDULER_API:
+        raise SystemExit("unknown api_version '{}' - choose one of {}".format(
+            args.api_version, ", ".join(sorted(SCHEDULER_API))))
+    if args.api_version == "v0":
+        log.warn("scheduler v0 is deprecated and has no maxSoc field - "
+                 "--max-soc will be ignored")
+
     if args.command == "force-charge":
         args.mode = "ForceCharge"
         args.command = "set"
@@ -444,6 +639,7 @@ def main(argv=None):
         "settings": cmd_settings,
         "set": cmd_set,
         "clear": cmd_clear,
+        "flag": cmd_flag,
     }
     handlers[args.command](args, config, log)
 
