@@ -125,7 +125,11 @@ Discharge. Getting this wrong is what made grid charging silently no-op:
 
 - `fdPwr` — the ceiling on power in that mode. For `ForceCharge` it is the max AC
   power drawn **from the grid**, so `0` means "never import" and nothing charges.
-  Range 0–6000.
+  The real range is **per-device**: v3's `scheduler/get` reports it under
+  `properties.fdPwr.range.max` (v3 also returns `maxGroupCount` there). The v0/v1
+  sections state a flat 0–6000, so `FD_PWR_LEGACY_MAX` drives a warning when a
+  larger value is sent to those versions. `DEFAULT_FD_PWR` is 10500 — don't lower
+  it back to 6000 assuming the spec's v0 range applies everywhere.
 - `fdSoc` — the SoC at which charging or discharging **stops**. For `ForceCharge`
   that is the target, so it defaults to `maxSoc`; defaulting it to the discharge
   floor stops charging immediately. Must be ≥ `minSocOnGrid`.

@@ -103,12 +103,16 @@ WORK_MODES = SCHEDULER_WORK_MODES + ("PeakShaving",)
 # "FC/FD" fields - they apply to Force Charge as well as Force Discharge.
 FORCE_MODES = ("ForceCharge", "ForceDischarge")
 
-# fdPwr is documented as ranging 0-6000. For ForceCharge it is the ceiling on AC
-# power drawn from the grid, so 0 means "never import" and force charging simply
-# does nothing. Default to the documented maximum and let the inverter clamp to
-# whatever its hardware allows.
-DEFAULT_FD_PWR = 6000
-FD_PWR_MAX = 6000
+# fdPwr is the ceiling on AC power drawn from the grid in ForceCharge, so 0 means
+# "never import" and force charging simply does nothing.
+#
+# The real ceiling is per-device: the v3 scheduler/get response reports it under
+# properties.fdPwr.range.max, so run `get` to see what your inverter allows. The
+# v0 and v1 sections of the API document state a flat 0-6000, which is why
+# exceeding that on those versions gets a warning.
+DEFAULT_FD_PWR = 10500
+FD_PWR_MAX = 10500
+FD_PWR_LEGACY_MAX = 6000
 
 # minSocOnGrid is documented as ranging 10-100.
 MIN_SOC_ON_GRID_FLOOR = 10
@@ -374,7 +378,8 @@ def parse_hhmm(value, label):
     return hour, minute
 
 
-def resolve_force_params(work_mode, max_soc, min_soc_on_grid, fd_soc, fd_pwr, log):
+def resolve_force_params(version, work_mode, max_soc, min_soc_on_grid,
+                         fd_soc, fd_pwr, log):
     """
     Work out fdSoc and fdPwr, which the API document describes as shared "FC/FD"
     fields - they govern Force Charge as well as Force Discharge:
@@ -401,6 +406,9 @@ def resolve_force_params(work_mode, max_soc, min_soc_on_grid, fd_soc, fd_pwr, lo
         raise SystemExit("--fd-pwr must be between 0 and {}, got {}".format(
             FD_PWR_MAX, fd_pwr))
 
+    if fd_pwr > FD_PWR_LEGACY_MAX and version != "v3":
+        log.warn("--fd-pwr {} exceeds the {} documented for scheduler {} - the "
+                 "inverter may reject it".format(fd_pwr, FD_PWR_LEGACY_MAX, version))
     if work_mode in FORCE_MODES and fd_pwr == 0:
         log.warn("--fd-pwr is 0, so {} cannot move any power and will appear to "
                  "do nothing".format(work_mode))
@@ -497,6 +505,7 @@ def cmd_set(args, config, log):
     if fd_pwr is None and config.get("fd_pwr"):
         fd_pwr = int(config["fd_pwr"])
     fd_soc, fd_pwr = resolve_force_params(
+        version=version,
         work_mode=args.mode,
         max_soc=args.max_soc,
         min_soc_on_grid=min_soc_on_grid,
@@ -601,8 +610,10 @@ def main(argv=None):
                               "(default: maxSoc for ForceCharge, else minSocOnGrid)")
         sub.add_argument("--fd-pwr", type=int, default=None,
                          help="max power in watts for force charge/discharge; for "
-                              "ForceCharge this caps grid import, and 0 disables it "
-                              "(default: {})".format(DEFAULT_FD_PWR))
+                              "ForceCharge this caps grid import, and 0 disables it. "
+                              "The real ceiling is per-device - see "
+                              "properties.fdPwr.range.max in `get` (default: {})".format(
+                                  DEFAULT_FD_PWR))
 
     add_window_args(subparsers.add_parser(
         "set", help="write a single-window schedule"), with_mode=True)

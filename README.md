@@ -40,11 +40,17 @@ both as shared **FC/FD** fields — they apply to Force *Charge* as well as Forc
 
 | Parameter | Meaning in `ForceCharge` | Default here |
 | --- | --- | --- |
-| `fdPwr` | Ceiling on AC power the inverter may draw **from the grid**. `0` means it may not import at all, so nothing charges. | `6000` W |
+| `fdPwr` | Ceiling on AC power the inverter may draw **from the grid**. `0` means it may not import at all, so nothing charges. | `10500` W |
 | `fdSoc` | The SoC at which charging **stops**. Set below the current SoC and charging ends immediately. | same as `--max-soc` |
 
 Both are settable with `--fd-pwr` / `--fd-soc`, and the script warns if you
 choose values that would silently do nothing.
+
+The `fdPwr` ceiling is **per-device**. On v3 the inverter reports its own limit,
+so run `get` and look for `properties.fdPwr.range.max` to see yours; lower
+`--fd-pwr` (or `fd_pwr` in the config) if your supply or breaker can't take the
+full rate. The v0 and v1 sections of the API document state a flat 0–6000, so the
+script warns if you exceed that on those versions.
 
 Separately, the scheduler has a **master switch** ("timing mode"). Groups
 written while it is off are stored but never act. `set` / `force-charge` turn it
@@ -164,6 +170,14 @@ If your off-peak window moves from day to day, replace the fixed `"12:00"` /
 `"14:00"` above with templates drawn from whatever sensor or input helper holds
 today's times, and keep the clear automation as-is.
 
+> **Testing on a weekday? Clear it manually afterwards.** Home Assistant's "Run"
+> button skips an automation's triggers *and* conditions, so the set automation
+> fires on any day — but the paired clear automation still won't run on a weekday,
+> because its `weekday` condition only passes at the weekend. Since the schedule
+> repeats daily until cleared, a weekday test otherwise leaves a live 12:00–14:00
+> grid-charge window running every day, possibly at peak rates. Run
+> `foxess_schedule.py clear` when you're done, or test at the weekend.
+
 ### Which path do I use: `/config` or `/homeassistant`?
 
 On Home Assistant OS the config directory is visible at **two different paths
@@ -274,7 +288,7 @@ the scheduler sections are around pages 104–136.
 | `api_key`         | file / env / HA | —                            | FoxESS Open API key (required).                                                                                                 |
 | `device_sn`       | file / env / HA | —                            | Inverter serial number (required).                                                                                              |
 | `min_soc_on_grid` | file            | `10`                         | Grid-present discharge floor, percent (10–100). Applies only to `set` / `force-charge`, and is overridden by `--min-soc-on-grid` if given. |
-| `fd_pwr`          | file            | `6000`                       | Max force charge/discharge power in watts (0–6000). For `ForceCharge` this caps grid import. Overridden by `--fd-pwr`.           |
+| `fd_pwr`          | file            | `10500`                      | Max force charge/discharge power in watts. For `ForceCharge` this caps grid import. The real ceiling is per-device. Overridden by `--fd-pwr`. |
 | `api_version`     | file            | `v3`                         | Scheduler API version: `v0`, `v1` or `v3`. Overridden by `--api-version`.                                                       |
 | `log_file`        | file            | `/config/scripts/foxess.log` | Path for the append log (rotates to `.1` at ~1 MB).                                                                             |
 | `log_max_bytes`   | file            | `1048576`                    | Log size before rotation.                                                                                                       |
@@ -299,9 +313,10 @@ Global flags (must appear **before** the subcommand):
 - `--fd-soc` — the SoC at which force charge/discharge **stops**. Defaults to
   `--max-soc` for `ForceCharge`, otherwise to the effective `min-soc-on-grid`.
   Must be ≥ `minSocOnGrid`.
-- `--fd-pwr` — max force charge/discharge power in watts (0–6000). For
-  `ForceCharge` this is the ceiling on **grid import**, so `0` disables charging.
-  Falls back to `fd_pwr` from the config file, then `6000`.
+- `--fd-pwr` — max force charge/discharge power in watts. For `ForceCharge` this
+  is the ceiling on **grid import**, so `0` disables charging. Falls back to
+  `fd_pwr` from the config file, then `10500`. The true maximum is device-specific
+  — check `properties.fdPwr.range.max` in `get`.
 
 `flag` flags: `--enable` / `--disable`. With neither, the switch is read.
 
