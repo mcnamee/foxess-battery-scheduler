@@ -10,8 +10,8 @@ free) windows — even when those windows move from day to day.
 talks to the [FoxESS Open Cloud API](https://www.foxesscloud.com) to read and
 write the inverter's **scheduler**. It lets you:
 
-- **`force-charge`** — set a one-off window in which the battery charges from the
-  grid up to a target state of charge (e.g. charge to 100% between 12:00 and
+- **`force-charge`** — set one or more windows in which the battery charges from
+  the grid up to a target state of charge (e.g. charge to 100% between 12:00 and
   14:00 while your tariff is cheap or free).
 - **`set`** — write a single-window schedule for any work mode in the scheduler
   enumeration (`SelfUse`, `Feedin`, `Backup`, `ForceCharge`, `ForceDischarge`).
@@ -56,6 +56,49 @@ Separately, the scheduler has a **master switch** ("timing mode"). Groups
 written while it is off are stored but never act. `set` / `force-charge` turn it
 on and `clear` turns it off; use `--no-master-switch` to leave it untouched, or
 the `flag` subcommand to inspect it.
+
+### Scheduling more than one window
+
+The API's `groups` field is a list, so a single call can write several windows,
+each with its own times, work mode and SoC target. Repeat `--start` and `--end`
+to add windows:
+
+```bash
+# Two force-charge windows: overnight to 80%, then midday to 100%
+python3 foxess_schedule.py force-charge \
+  --start 02:00 --end 05:00 --max-soc 80 \
+  --start 12:00 --end 14:00 --max-soc 100
+```
+
+`--start` and `--end` must be given the same number of times, and together they
+define how many windows there are. The other per-window options — `--max-soc`,
+`--fd-soc`, and `--mode` on `set` — follow a simple rule:
+
+- **give it once** and that value applies to every window;
+- **give it once per window** to vary it.
+
+Anything else is an error rather than a silent guess. `--min-soc-on-grid` and
+`--fd-pwr` are not per-window; they apply to the whole schedule.
+
+`--mode` makes mixed schedules possible on `set`:
+
+```bash
+# Charge overnight, then sell to the grid in the afternoon peak
+python3 foxess_schedule.py set \
+  --mode ForceCharge   --start 02:00 --end 05:00 --max-soc 100 \
+  --mode ForceDischarge --start 17:00 --end 20:00
+```
+
+Two constraints worth knowing:
+
+- **Windows may not overlap.** The inverter has no defined behaviour for two
+  groups covering the same minute, so the script rejects it. Windows that merely
+  touch (`12:00–14:00` and `14:00–16:00`) are fine.
+- **A write replaces the whole schedule.** Every group not included in the call
+  is removed, so pass all the windows you want each time.
+
+How many windows your inverter accepts is device-specific — run `get` and look
+for `maxGroupCount` in the response.
 
 ## Dependency on the macxq foxess-ha HACS integration
 
@@ -303,16 +346,18 @@ Global flags (must appear **before** the subcommand):
 - `--api-version {v0,v1,v3}` — scheduler API version (default `v3`).
 - `--no-master-switch` — do not touch the scheduler master switch.
 
-`set` / `force-charge` flags:
+`set` / `force-charge` flags. The first four are **per-window and repeatable** —
+see [Scheduling more than one window](#scheduling-more-than-one-window):
 
-- `--start HH:MM` / `--end HH:MM` — the window (24-hour; must not span midnight).
+- `--start HH:MM` / `--end HH:MM` — a window (24-hour; must not span midnight).
+  Repeat both to add windows; their counts must match.
 - `--max-soc` — charge ceiling percent (default `100`). Ignored on `v0`.
-- `--min-soc-on-grid` — grid-present discharge floor percent (10–100). Falls back
-  to `min_soc_on_grid` from the config file, then `10`.
 - `--mode` — work mode for `set` (default `ForceCharge`).
-- `--fd-soc` — the SoC at which force charge/discharge **stops**. Defaults to
-  `--max-soc` for `ForceCharge`, otherwise to the effective `min-soc-on-grid`.
-  Must be ≥ `minSocOnGrid`.
+- `--fd-soc` — the SoC at which force charge/discharge **stops**. Defaults to that
+  window's `--max-soc` for `ForceCharge`, otherwise to the effective
+  `min-soc-on-grid`. Must be ≥ `minSocOnGrid`.
+- `--min-soc-on-grid` — grid-present discharge floor percent (10–100), for the
+  whole schedule. Falls back to `min_soc_on_grid` from the config file, then `10`.
 - `--fd-pwr` — max force charge/discharge power in watts. For `ForceCharge` this
   is the ceiling on **grid import**, so `0` disables charging. Falls back to
   `fd_pwr` from the config file, then `10500`. The true maximum is device-specific
@@ -329,6 +374,9 @@ Global flags (must appear **before** the subcommand):
 - Schedule windows cannot span midnight; split them into two windows if needed.
 - A scheduler group has no day-of-week field, so a window repeats every day
   until it is cleared. See the weekend automation example above.
+- Writing a schedule **replaces** every group on the inverter, so include all the
+  windows you want in each call. `maxGroupCount` in `get` reports how many your
+  device supports.
 - `PeakShaving` is accepted on the command line but is not in the scheduler
   `workMode` enumeration, so the inverter may reject it. The script warns.
 - The API signature depends on the system clock, so keep your host's time

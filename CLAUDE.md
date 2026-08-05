@@ -63,9 +63,16 @@ project is the one script plus this documentation.
 - **New subcommands** go in `main()`'s `subparsers`, get a `cmd_*` handler with
   the `(args, config, log)` signature, and are registered in the `handlers`
   dict. `force-charge` is an alias that rewrites `args.mode`/`args.command`
-  before dispatch — follow that pattern for other aliases. `set` and
+  before dispatch — follow that pattern for other aliases. Note the alias assigns
+  a **list** (`["ForceCharge"]`) because `--mode` is per-window. `set` and
   `force-charge` share their arguments via the `add_window_args()` helper, so add
   new window options there rather than to one parser only.
+- **Per-window options are repeatable `action="append"` lists.** `--start`/`--end`
+  define the window count; `--max-soc`, `--fd-soc` and `--mode` are broadcast by
+  `expand_per_window()`, which accepts one value for all windows or one per
+  window and errors on any other count. `--min-soc-on-grid` and `--fd-pwr` are
+  deliberately schedule-wide, not per-window. `check_windows_dont_overlap()`
+  rejects overlapping windows; touching windows are allowed.
 - **Every command must honour `--dry-run`.** It flows through to `api_post()`,
   which logs the payload and returns a synthetic success without sending. Any
   new API call must pass `dry_run=args.dry_run`.
@@ -94,7 +101,10 @@ is often unreachable from sandboxed environments, so the PDF is the reference.
   per second** — `cmd_settings()` sleeps 1.1s between reads, and so does any
   command that makes two calls. Don't add chatty polling loops.
 - Writing schedule groups is `scheduler/enable` with a `groups` list; an empty
-  list clears the schedule.
+  list clears the schedule. The list takes **several groups** — the spec's own
+  v0/v1 examples send two with different times, modes and SoC values — and a
+  write **replaces** the entire schedule, so every wanted window must be included
+  each time. The per-device cap is `maxGroupCount` in v3's `scheduler/get`.
 - Scheduler windows **cannot span midnight** — `build_group()` rejects
   `end <= start` on purpose. Callers needing an overnight window must issue two
   windows.

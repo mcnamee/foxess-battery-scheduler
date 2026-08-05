@@ -9,6 +9,12 @@ Usage:
     foxess_schedule.py get
     foxess_schedule.py force-charge --start 12:00 --end 14:00 --max-soc 100
     foxess_schedule.py clear
+
+Repeat --start/--end to write several windows in one call. --max-soc, --fd-soc and
+--mode are per-window too: give them once to apply to every window, or once per
+window to vary them.
+    foxess_schedule.py force-charge --start 02:00 --end 05:00 --max-soc 80 \
+                                    --start 12:00 --end 14:00 --max-soc 100
     foxess_schedule.py settings          # read current WorkMode / SoC settings
     foxess_schedule.py flag              # read the scheduler master switch
 
@@ -458,6 +464,46 @@ def build_group(version, start, end, work_mode, max_soc, min_soc_on_grid,
     return group
 
 
+def expand_per_window(values, count, label, default):
+    """
+    Broadcast a repeatable per-window option out to one value per window.
+
+    Passing the option once applies that value to every window, which keeps
+    `--start 02:00 --end 05:00 --start 12:00 --end 14:00 --max-soc 100` doing the
+    obvious thing. Otherwise the count has to match the number of windows.
+    """
+    if not values:
+        return [default] * count
+    if len(values) == 1:
+        return list(values) * count
+    if len(values) != count:
+        raise SystemExit(
+            "{} was given {} times but there {} {} window{} - pass it once to "
+            "apply to all, or once per window".format(
+                label, len(values), "is" if count == 1 else "are", count,
+                "" if count == 1 else "s"))
+    return list(values)
+
+
+def check_windows_dont_overlap(windows):
+    """
+    Reject overlapping windows. The inverter has no defined behaviour for two
+    groups covering the same minute, so this is virtually always a mistake.
+    """
+    spans = []
+    for start, end in windows:
+        start_hour, start_minute = parse_hhmm(start, "--start")
+        end_hour, end_minute = parse_hhmm(end, "--end")
+        spans.append((start_hour * 60 + start_minute, end_hour * 60 + end_minute,
+                      start, end))
+    spans.sort()
+    for earlier, later in zip(spans, spans[1:]):
+        if later[0] < earlier[1]:
+            raise SystemExit(
+                "windows {}-{} and {}-{} overlap".format(
+                    earlier[2], earlier[3], later[2], later[3]))
+
+
 def set_master_switch(version, config, log, enable, dry_run):
     """
     Flip the scheduler master switch ("timing mode"). Groups written while this
@@ -496,44 +542,63 @@ def cmd_set(args, config, log):
     if not (MIN_SOC_ON_GRID_FLOOR <= min_soc_on_grid <= 100):
         raise SystemExit("minSocOnGrid must be between {} and 100, got {}".format(
             MIN_SOC_ON_GRID_FLOOR, min_soc_on_grid))
-    if args.mode not in SCHEDULER_WORK_MODES:
-        log.warn("'{}' is not in the scheduler workMode enumeration ({}) - the "
-                 "inverter may reject it".format(
-                     args.mode, ", ".join(SCHEDULER_WORK_MODES)))
+    # --start/--end are repeatable and define how many windows there are; the
+    # other per-window options broadcast out to match.
+    if len(args.start) != len(args.end):
+        raise SystemExit(
+            "--start was given {} times but --end {} - they must pair up".format(
+                len(args.start), len(args.end)))
+    count = len(args.start)
+    check_windows_dont_overlap(list(zip(args.start, args.end)))
+
+    modes = expand_per_window(getattr(args, "mode", None), count, "--mode",
+                              "ForceCharge")
+    max_socs = expand_per_window(args.max_soc, count, "--max-soc", 100)
+    fd_socs = expand_per_window(args.fd_soc, count, "--fd-soc", None)
 
     fd_pwr = args.fd_pwr
     if fd_pwr is None and config.get("fd_pwr"):
         fd_pwr = int(config["fd_pwr"])
-    fd_soc, fd_pwr = resolve_force_params(
-        version=version,
-        work_mode=args.mode,
-        max_soc=args.max_soc,
-        min_soc_on_grid=min_soc_on_grid,
-        fd_soc=args.fd_soc,
-        fd_pwr=fd_pwr,
-        log=log,
-    )
 
-    group = build_group(
-        version=version,
-        start=args.start,
-        end=args.end,
-        work_mode=args.mode,
-        max_soc=args.max_soc,
-        min_soc_on_grid=min_soc_on_grid,
-        fd_soc=fd_soc,
-        fd_pwr=fd_pwr,
-    )
-    log.info("setting single {} window {}-{} on {} maxSoc={} minSocOnGrid={} "
-             "fdSoc={} fdPwr={}".format(args.mode, args.start, args.end, version,
-                                        args.max_soc, min_soc_on_grid, fd_soc, fd_pwr))
+    groups = []
+    for index in range(count):
+        mode = modes[index]
+        if mode not in SCHEDULER_WORK_MODES:
+            log.warn("'{}' is not in the scheduler workMode enumeration ({}) - the "
+                     "inverter may reject it".format(
+                         mode, ", ".join(SCHEDULER_WORK_MODES)))
+        window_fd_soc, window_fd_pwr = resolve_force_params(
+            version=version,
+            work_mode=mode,
+            max_soc=max_socs[index],
+            min_soc_on_grid=min_soc_on_grid,
+            fd_soc=fd_socs[index],
+            fd_pwr=fd_pwr,
+            log=log,
+        )
+        groups.append(build_group(
+            version=version,
+            start=args.start[index],
+            end=args.end[index],
+            work_mode=mode,
+            max_soc=max_socs[index],
+            min_soc_on_grid=min_soc_on_grid,
+            fd_soc=window_fd_soc,
+            fd_pwr=window_fd_pwr,
+        ))
+        log.info("window {}/{}: {} {}-{} maxSoc={} fdSoc={} fdPwr={}".format(
+            index + 1, count, mode, args.start[index], args.end[index],
+            max_socs[index], window_fd_soc, window_fd_pwr))
+
+    log.info("setting {} window{} on {} minSocOnGrid={}".format(
+        count, "" if count == 1 else "s", version, min_soc_on_grid))
 
     # The groups are useless while the master switch is off, so turn it on first.
     if not args.no_master_switch:
         set_master_switch(version, config, log, 1, args.dry_run)
         time.sleep(1.1)  # stay inside the ~1 request/second budget
 
-    payload = {"deviceSN": config["device_sn"], "groups": [group]}
+    payload = {"deviceSN": config["device_sn"], "groups": groups}
     if version == "v3":
         # false: leave extraParam fields we did not send alone.
         payload["isDefault"] = False
@@ -597,21 +662,28 @@ def main(argv=None):
     flag_parser.set_defaults(enable=None)
 
     def add_window_args(sub, with_mode):
-        sub.add_argument("--start", required=True, help="window start, HH:MM")
-        sub.add_argument("--end", required=True, help="window end, HH:MM")
+        # --start/--end/--max-soc/--mode/--fd-soc are per-window and repeatable:
+        # repeat --start/--end to schedule several windows in one call, and give
+        # the others either once (applies to all) or once per window.
+        sub.add_argument("--start", required=True, action="append",
+                         help="window start, HH:MM (repeat for more windows)")
+        sub.add_argument("--end", required=True, action="append",
+                         help="window end, HH:MM (repeat for more windows)")
         if with_mode:
-            sub.add_argument("--mode", default="ForceCharge", choices=WORK_MODES)
-        sub.add_argument("--max-soc", type=int, default=100,
-                         help="charge ceiling percent (default: %(default)s)")
+            sub.add_argument("--mode", action="append", choices=WORK_MODES,
+                             help="work mode per window (default: ForceCharge)")
+        sub.add_argument("--max-soc", type=int, action="append",
+                         help="charge ceiling percent per window (default: 100)")
         sub.add_argument("--min-soc-on-grid", type=int, default=None,
-                         help="grid-present discharge floor percent (10-100)")
-        sub.add_argument("--fd-soc", type=int, default=None,
-                         help="SoC at which force charge/discharge stops "
+                         help="grid-present discharge floor percent (10-100), "
+                              "applies to all windows")
+        sub.add_argument("--fd-soc", type=int, action="append",
+                         help="SoC at which force charge/discharge stops, per window "
                               "(default: maxSoc for ForceCharge, else minSocOnGrid)")
         sub.add_argument("--fd-pwr", type=int, default=None,
-                         help="max power in watts for force charge/discharge; for "
-                              "ForceCharge this caps grid import, and 0 disables it. "
-                              "The real ceiling is per-device - see "
+                         help="max power in watts for force charge/discharge, applies "
+                              "to all windows; for ForceCharge this caps grid import, "
+                              "and 0 disables it. The real ceiling is per-device - see "
                               "properties.fdPwr.range.max in `get` (default: {})".format(
                                   DEFAULT_FD_PWR))
 
@@ -642,7 +714,7 @@ def main(argv=None):
                  "--max-soc will be ignored")
 
     if args.command == "force-charge":
-        args.mode = "ForceCharge"
+        args.mode = ["ForceCharge"]  # per-window list, broadcast across windows
         args.command = "set"
 
     handlers = {
